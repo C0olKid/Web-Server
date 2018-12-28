@@ -37,9 +37,9 @@ int make_server_socket(int);
 void child_waiter(int);
 void parse_request(const char*, rq*);
 void process_rq(int, const char*);
-void process_php(const char*, const char*, ds*);
-void process_static(const char*, ds*);
-void process_error(int, ds*);
+int process_php(const char*, const char*, ds*);
+int process_static(const char*, ds*);
+void process_status(int, ds*);
 void concat(ds*, ds*);
 void log(struct sockaddr_in*, const char*);
 
@@ -118,6 +118,7 @@ int main(void)
 /*******************处理请求****************/
 void process_rq(int socket, const char* request_str)
 {
+    int status = 500;                       //定义状态返回码
     rq request;                             //定义请求结构体并初始化
     ds content, response;                   //定义数据流载荷结构体
     bzero(&request, sizeof(request));       //初始化
@@ -134,13 +135,10 @@ void process_rq(int socket, const char* request_str)
 
     //为响应载荷分配内存
     response.data = (char*)malloc(RESPONSE_SIZE);
+    bzero(response.data, RESPONSE_SIZE);
 
-    //定义响应HTTP头
-    const char* http_header = (const char*)"HTTP/1.0 200 OK\r\nServer: CoolKid Web Server\r\n";
-
-    //响应载荷添加HTTP头部信息
-    strncpy(response.data, http_header, strlen(http_header));
-    response.length = strlen(response.data);
+    //定义响应HTTP头格式
+    const char* http_header_format = (const char*)"HTTP/1.0 %3d OK\r\nServer: CoolKid Web Server\r\n";
 
     //如果HTTP请求方法为GET方法
     if(strcmp(request.cmd, "GET") == 0){
@@ -148,44 +146,56 @@ void process_rq(int socket, const char* request_str)
         if(strncmp(request.extension, "php", 3) == 0){
 
             //若请求为php页面，进行php解析
-            process_php(request.path, request.arg, &content);
+            status = process_php(request.path, request.arg, &content);
+
+            //根据返回状态码进一步处理
+            process_status(status, &content);
 
         }else{
 
             //若请求为静态文件，进行文件传输
-            process_static(request.path, &content); 
+            status = process_static(request.path, &content); 
 
-            //为http头部末尾添加一个换行符
-            sprintf(response.data, "%s\r\n", response.data);
-            response.length += strlen("\r\n");
+            //根据返回状态码进一步处理
+            process_status(status, &content);
+
+            //为content前面添加一个换行符
+            char* tmp = (char*)malloc(content.length + strlen("\r\n"));
+            strcpy(tmp, "\r\n");
+            memcpy(tmp + strlen("\r\n"), content.data, content.length);
+            free(content.data);
+            content.data = tmp;
+            content.length += strlen("\r\n");
         }
-
-        //将头部与载荷进行连接
-        concat(&response, &content);
-
-        //将响应内容写回socket
-        write(socket, response.data, response.length);
-
-        //释放申请的内存
-        free(content.data);
-        free(response.data);
     }
+
+    //将http头部写入响应载荷
+    sprintf(response.data, http_header_format, status);
+    response.length = strlen(response.data);
+
+    //将http头部与content的内容连接起来
+    concat(&response, &content);
+
+    //将响应内容写回socket
+    write(socket, response.data, response.length);
+
+    //释放申请的内存
+    free(content.data);
+    free(response.data);
 
     //退出子进程
     exit(0);
 }
 
 /***************处理静态请求******************/
-void process_static(const char* path, ds* content)
+int process_static(const char* path, ds* content)
 {
     ds buffer;                                  //定义缓冲变量
     struct stat buf;                            //文件信息变量
 
     //如果获取文件信息失败，返回500错误
     if(stat(path, &buf) == -1){
-        bzero(content, sizeof(*content));
-        process_error(404, content);
-        return;
+        return 404;
     }
 
     //如果目标路径是一个目录
@@ -205,9 +215,7 @@ void process_static(const char* path, ds* content)
         //若打开目录失败，返回500错误
         if((dp = opendir(path)) == NULL){
             free(content->data);
-            bzero(content, sizeof(*content));
-            process_error(500, content);
-            return;
+            return 500;
         }
 
         //进入目标目录
@@ -271,9 +279,7 @@ void process_static(const char* path, ds* content)
         //打开失败，返回服务器500错误
         if(fp == NULL){
             free(content->data);
-            bzero(content, sizeof(*content));
-            process_error(500, content);
-            return;
+            return 500;
         }
 
         //将文件内容读入载荷
@@ -283,10 +289,11 @@ void process_static(const char* path, ds* content)
         //关闭文件流
         fclose(fp);
     }
+    return 200;
 }
 
 /****************处理php请求***************/
-void process_php(const char* path, const char* arg, ds* content)
+int process_php(const char* path, const char* arg, ds* content)
 {
     ds buffer;                                  //定义缓冲区
     bzero(&buffer, sizeof(buffer));             //初始化缓冲区
@@ -309,9 +316,7 @@ void process_php(const char* path, const char* arg, ds* content)
 
     //如果失败，返回服务器500错误
     if(fp == NULL){
-        bzero(content, sizeof(*content));
-        process_error(500, content);
-        return;
+        return 500;
     } 
 
     //循环读取解析结果
@@ -333,6 +338,8 @@ void process_php(const char* path, const char* arg, ds* content)
 
     //关闭文件流
     pclose(fp);
+
+    return 200;
 }
 
 /**************子进程处理，避免僵尸进程********/
@@ -426,15 +433,19 @@ int make_server_socket(int portnum)
 }
 
 /***************处理错误页面*******************************/
-void process_error(int error_code, ds* content)
+void process_status(int status, ds* content)
 {
     char path[20];
 
-    switch(error_code){
+    switch(status){
+        case 200:
+            return;
         case 404:
+            bzero(content, sizeof(*content));
             strcpy(path, (const char*)"/var/www/404.html"); 
             break;
         default:
+            bzero(content, sizeof(*content));
             strcpy(path, (const char*)"/var/www/500.html");
             break;
     }
